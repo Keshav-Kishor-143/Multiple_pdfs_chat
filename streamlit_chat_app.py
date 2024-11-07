@@ -11,7 +11,7 @@ from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 import json
 
-# Load environment variables (API keys, etc.) from a .env file
+# Load environment variables
 load_dotenv()
 
 # Streamlit page configuration
@@ -28,18 +28,18 @@ def get_pdf_text(pdf_docs):
         for page in pdf_reader.pages:
             text += page.extract_text() or ""
     
-    # Limit the text to the first 50,000 characters to avoid tokenization issues
+    # Limit the text to avoid tokenization issues
     text = text[:50000]
     return text
 
-# Function to split text into meaningful chunks with metadata for vector embedding
+# Function to split text into detailed chunks with overlap for rich context
 def get_text_chunks_with_metadata(text, section_name=""):
-    # Increase chunk size with overlap to capture context-rich information
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=400)
+    # Small chunk size with overlap for granular retrieval
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=300)
     chunks = text_splitter.split_text(text)
     return [{"text": chunk, "metadata": {"section": section_name}} for chunk in chunks]
 
-# Function to store text chunks in a JSON file and create a FAISS vector store
+# Store text chunks in JSON and create FAISS vector store with metadata
 def ingest_documents_with_metadata(text_chunks):
     with open(CHUNKS_PATH, "w") as f:
         json.dump(text_chunks, f)
@@ -51,7 +51,7 @@ def ingest_documents_with_metadata(text_chunks):
     vector_store = FAISS.from_texts(texts, embeddings, metadatas=metadatas)
     return vector_store
 
-# Function to load existing vector store from file if available
+# Load existing vector store if available
 def get_existing_vector_store():
     if os.path.exists(CHUNKS_PATH):
         with open(CHUNKS_PATH, "r") as f:
@@ -62,28 +62,30 @@ def get_existing_vector_store():
         return vector_store
     return None
 
-# Function to create a conversation chain with a prompt template focused on detailed document-based answers
+# Function to create a conversation chain focused on detailed document-based answers
 def get_conversation_chain(vector_store):
     openai_api_key = os.getenv("OPENAI_API_KEY")
     llm = ChatOpenAI(model_name="gpt-3.5-turbo", openai_api_key=openai_api_key, temperature=0.5)
-    retriever = vector_store.as_retriever(search_kwargs={"k": 8, "score_threshold": 0.2})  # Higher k for more context
-
+    
+    # Low score_threshold, high k for granular retrieval
+    retriever = vector_store.as_retriever(search_kwargs={"k": 10, "score_threshold": 0.1})
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
-    # Define the prompt template with focused instructions
+    # Detailed, document-focused prompt template
     prompt_template = PromptTemplate(
         input_variables=["question", "context"],
         template=(
-            "You are an assistant answering questions strictly based on the provided document content. "
-            "Return all detailed, relevant information available from the document without summarizing or omitting details. "
-            "If the document has procedural steps or specific instructions, list them exactly as they appear.\n\n"
+            "You are an assistant answering questions based solely on the content of a document. "
+            "Return all detailed, relevant information from the document, preserving step-by-step instructions "
+            "and specific phrases. If the document contains instructions or specific procedures, include those "
+            "exactly as listed.\n\n"
             "Context: {context}\n\n"
             "Question: {question}\n\n"
-            "Answer accurately based only on the document content with detailed explanations."
+            "Answer based only on the document content, providing comprehensive detail."
         )
     )
 
-    # Create the RetrievalQA chain with the detailed prompt template
+    # Create RetrievalQA chain with the custom prompt
     qa_chain = RetrievalQA.from_llm(
         llm=llm,
         retriever=retriever,
@@ -108,7 +110,6 @@ def main():
         st.subheader("Your documents here:")
         pdf_docs = st.file_uploader("Upload PDFs and click on 'Process'", accept_multiple_files=True)
         
-        # Show the "New Chat" button only if there's a question and an answer
         if "question" in st.session_state and "answer" in st.session_state:
             if st.session_state["question"] and st.session_state["answer"]:
                 if st.button("🗨️ New Chat"):
@@ -119,7 +120,6 @@ def main():
                     st.session_state["question"] = ""
                     st.session_state["answer"] = ""
 
-        # Process new PDFs, extract and embed their contents
         if st.button("Process New PDFs"):
             if pdf_docs:
                 with st.spinner("Processing new documents..."):
@@ -137,7 +137,6 @@ def main():
             else:
                 st.warning("Please upload at least one PDF document.")
 
-        # Load existing document embeddings and initialize a conversation chain
         if st.button("Load Existing Documents"):
             vector_store = get_existing_vector_store()
             if vector_store:
@@ -152,14 +151,12 @@ def main():
             else:
                 st.warning("No existing documents found. Please upload and process new PDFs first.")
         
-        # Display chat history in sidebar
         st.subheader("Chat History")
         for i, (question, answer) in enumerate(st.session_state.get("history", [])):
             if st.button(f"Q{i+1}: {question[:30]}..."):
                 st.session_state["selected_history"] = (question, answer)
                 st.session_state["is_from_history"] = True
 
-    # Display the selected question from history in the input box, if applicable
     if "selected_history" in st.session_state and not st.session_state.get("new_chat", False):
         selected_question, selected_answer = st.session_state["selected_history"]
         user_question = st.text_input("Ask a question from the uploaded documents:", selected_question)
@@ -167,7 +164,6 @@ def main():
         user_question = st.text_input("Ask a question from the uploaded documents:")
         st.session_state["new_chat"] = False
 
-    # Check if there's a conversation chain in session and if a question was entered
     if 'conversation' in st.session_state and user_question:
         if st.session_state["is_from_history"]:
             answer = selected_answer
