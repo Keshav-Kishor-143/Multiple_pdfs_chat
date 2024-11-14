@@ -3,183 +3,167 @@ from dotenv import load_dotenv
 import os
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
+from langchain_openai.embeddings import OpenAIEmbeddings
 from langchain.vectorstores import FAISS
-from langchain.memory import ConversationBufferMemory
 from langchain.chat_models import ChatOpenAI
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema import HumanMessage 
 import json
+from collections import Counter
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+import re
 
 # Load environment variables
 load_dotenv()
 
-# Streamlit page configuration
+# Constants
+CHUNKS_PATH = "text_chunks.json"
+SIMILARITY_THRESHOLD = 0.3
+
+# Configure Streamlit page
 st.set_page_config(page_title="Chat with PDFs", page_icon=":books:")
 
-# Define the file path to store text chunks
-CHUNKS_PATH = "text_chunks.json"
-
-# Function to extract and truncate text from PDF files to avoid token limit issues
-def get_pdf_text(pdf_docs):
+# Helper Functions
+def extract_text_from_pdfs(pdf_docs):
     text = ""
     for pdf in pdf_docs:
         pdf_reader = PdfReader(pdf)
         for page in pdf_reader.pages:
             text += page.extract_text() or ""
+    return text[:50000]
+
+def split_text_into_chunks(text):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=300)
+    return text_splitter.split_text(text)
+
+def generate_summary(text):
+    """Generate a simple summary based on frequent keywords or key phrases."""
+    words = re.findall(r'\b\w+\b', text.lower())
+    common_words = Counter(words).most_common(100)
+    keywords = [word for word, freq in common_words if len(word) > 4]
     
-    # Limit the text to avoid tokenization issues
-    text = text[:50000]
-    return text
+    if "manual" in keywords and "operation" in keywords:
+        return "Owner's Manual or Operational Guide"
+    elif "report" in keywords or "summary" in keywords:
+        return "Technical Report"
+    elif "research" in keywords or "study" in keywords:
+        return "Research Document"
+    elif "specification" in keywords or "design" in keywords:
+        return "Technical Specification Document"
+    return "Document"
 
-# Function to split text into detailed chunks with overlap for rich context
-def get_text_chunks_with_metadata(text, section_name=""):
-    # Small chunk size with overlap for granular retrieval
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=300)
-    chunks = text_splitter.split_text(text)
-    return [{"text": chunk, "metadata": {"section": section_name}} for chunk in chunks]
-
-# Store text chunks in JSON and create FAISS vector store with metadata
-def ingest_documents_with_metadata(text_chunks):
+def store_chunks_and_create_vector_store(text_chunks):
     with open(CHUNKS_PATH, "w") as f:
         json.dump(text_chunks, f)
 
     openai_api_key = os.getenv("OPENAI_API_KEY")
     embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-    texts = [chunk["text"] for chunk in text_chunks]
-    metadatas = [chunk["metadata"] for chunk in text_chunks]
-    vector_store = FAISS.from_texts(texts, embeddings, metadatas=metadatas)
+    texts = [chunk for chunk in text_chunks]
+    vector_store = FAISS.from_texts(texts, embeddings)
     return vector_store
 
-# Load existing vector store if available
-def get_existing_vector_store():
+def load_existing_vector_store():
     if os.path.exists(CHUNKS_PATH):
         with open(CHUNKS_PATH, "r") as f:
             text_chunks = json.load(f)
         openai_api_key = os.getenv("OPENAI_API_KEY")
         embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-        vector_store = FAISS.from_texts([chunk["text"] for chunk in text_chunks], embeddings, metadatas=[chunk["metadata"] for chunk in text_chunks])
+        texts = [chunk for chunk in text_chunks]
+        vector_store = FAISS.from_texts(texts, embeddings)
         return vector_store
     return None
 
-# Function to create a conversation chain focused on detailed document-based answers
-def get_conversation_chain(vector_store):
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    llm = ChatOpenAI(model_name="gpt-3.5-turbo", openai_api_key=openai_api_key, temperature=0.5)
-    
-    # Low score_threshold, high k for granular retrieval
-    retriever = vector_store.as_retriever(search_kwargs={"k": 10, "score_threshold": 0.1})
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+def calculate_similarity(query_embedding, doc_embeddings):
+    """Calculate cosine similarity between the query embedding and document embeddings."""
+    return cosine_similarity([query_embedding], doc_embeddings).flatten()
 
-    # Detailed, document-focused prompt template
-    prompt_template = PromptTemplate(
-        input_variables=["question", "context"],
-        template=(
-            "You are an assistant answering questions based solely on the content of a document. "
-            "Return all detailed, relevant information from the document, preserving step-by-step instructions "
-            "and specific phrases. If the document contains instructions or specific procedures, include those "
-            "exactly as listed.\n\n"
-            "Context: {context}\n\n"
-            "Question: {question}\n\n"
-            "Answer based only on the document content, providing comprehensive detail."
-        )
+def generate_dynamic_out_of_context_message(summary):
+    return (
+        f"The sources provided are technical documents, primarily {summary}. "
+        "They contain information related to the document's specific content, but no relevant details were found for your query."
     )
 
-    # Create RetrievalQA chain with the custom prompt
-    qa_chain = RetrievalQA.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        prompt=prompt_template
-    )
-    
-    return qa_chain
-
-# Session state variables initialization
-if "is_from_history" not in st.session_state:
-    st.session_state["is_from_history"] = False
-if "new_chat" not in st.session_state:
-    st.session_state["new_chat"] = False
-
-# Main app function
+# Main Application
 def main():
-    st.header("Chat with multiple PDFs :books:")
-    
-    # Sidebar for uploading PDFs and history navigation
+    st.header("Chat with your PDFs :books:")
+
     with st.sidebar:
-        st.subheader("Your documents here:")
+        st.subheader("Your Documents:")
         pdf_docs = st.file_uploader("Upload PDFs and click on 'Process'", accept_multiple_files=True)
-        
-        if "question" in st.session_state and "answer" in st.session_state:
-            if st.session_state["question"] and st.session_state["answer"]:
-                if st.button("🗨️ New Chat"):
-                    if "selected_history" in st.session_state:
-                        del st.session_state["selected_history"]
-                    st.session_state["is_from_history"] = False
-                    st.session_state["new_chat"] = True
-                    st.session_state["question"] = ""
-                    st.session_state["answer"] = ""
 
         if st.button("Process New PDFs"):
             if pdf_docs:
                 with st.spinner("Processing new documents..."):
-                    raw_text = get_pdf_text(pdf_docs)
-                    text_chunks = get_text_chunks_with_metadata(raw_text)
-                    vector_store = ingest_documents_with_metadata(text_chunks)
-                    conversation = get_conversation_chain(vector_store)
-                    st.session_state['conversation'] = conversation
-                    
-                    if "selected_history" in st.session_state:
-                        del st.session_state["selected_history"]
-                    st.session_state["is_from_history"] = False
-
+                    raw_text = extract_text_from_pdfs(pdf_docs)
+                    text_chunks = split_text_into_chunks(raw_text)
+                    summary = generate_summary(raw_text)  # Generate summary
+                    vector_store = store_chunks_and_create_vector_store(text_chunks)
+                    st.session_state['vector_store'] = vector_store
+                    st.session_state['summary'] = summary  # Store summary
                     st.success("Documents processed and added to vector store. You can now ask questions.")
             else:
                 st.warning("Please upload at least one PDF document.")
 
         if st.button("Load Existing Documents"):
-            vector_store = get_existing_vector_store()
+            vector_store = load_existing_vector_store()
             if vector_store:
-                conversation = get_conversation_chain(vector_store)
-                st.session_state['conversation'] = conversation
-                
-                if "selected_history" in st.session_state:
-                    del st.session_state["selected_history"]
-                st.session_state["is_from_history"] = False
-
+                summary = st.session_state.get("summary", "a Document")
+                st.session_state['vector_store'] = vector_store
                 st.success("Loaded existing vector store. You can now ask questions.")
             else:
                 st.warning("No existing documents found. Please upload and process new PDFs first.")
-        
-        st.subheader("Chat History")
-        for i, (question, answer) in enumerate(st.session_state.get("history", [])):
-            if st.button(f"Q{i+1}: {question[:30]}..."):
-                st.session_state["selected_history"] = (question, answer)
-                st.session_state["is_from_history"] = True
 
-    if "selected_history" in st.session_state and not st.session_state.get("new_chat", False):
-        selected_question, selected_answer = st.session_state["selected_history"]
-        user_question = st.text_input("Ask a question from the uploaded documents:", selected_question)
-    else:
-        user_question = st.text_input("Ask a question from the uploaded documents:")
-        st.session_state["new_chat"] = False
+    # Main Chat Interface
+    user_question = st.text_input("Ask a question from the uploaded documents:")
 
-    if 'conversation' in st.session_state and user_question:
-        if st.session_state["is_from_history"]:
-            answer = selected_answer
-            st.session_state["is_from_history"] = False
-        else:
-            with st.spinner("Generating answer..."):
-                conversation = st.session_state['conversation']
-                response = conversation({"query": user_question})
-                answer = response["result"]
-                
-                st.session_state["question"] = user_question
-                st.session_state["answer"] = answer
-                st.session_state.setdefault("history", []).append((user_question, answer))
-        
-        st.write("### Answer:")
-        st.write(answer)
+    if 'vector_store' in st.session_state and user_question:
+        with st.spinner("Generating answer..."):
+            vector_store = st.session_state['vector_store']
+            summary = st.session_state.get("summary", "a Document")
+            
+            # Embed the user question for similarity-based retrieval
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+            query_embedding = embeddings.embed_query(user_question)
+            
+            # Retrieve top 5 relevant documents based on the query embedding
+            retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+            retrieved_docs = retriever.get_relevant_documents(user_question)
+            
+            # Calculate similarity scores manually
+            doc_embeddings = [embeddings.embed_query(doc.page_content) for doc in retrieved_docs]
+            similarity_scores = calculate_similarity(query_embedding, doc_embeddings)
+            
+            # Filter by threshold and sort by relevance
+            relevant_docs = sorted(
+                [(doc, score) for doc, score in zip(retrieved_docs, similarity_scores) if score >= SIMILARITY_THRESHOLD],
+                key=lambda x: x[1],
+                reverse=True
+            )
+            
+# Assuming you have gathered top_chunks (the top relevant document chunks) based on similarity scores
+            if relevant_docs:
+    # Join the top relevant document chunks
+             top_chunks = "\n\n".join([doc.page_content for doc, _ in relevant_docs])
+    
+    # Initialize the language model
+             llm = ChatOpenAI(model_name="gpt-4", openai_api_key=openai_api_key)
+    
+    # Construct the message for ChatOpenAI
+             user_message = HumanMessage(content=f"Answer the question '{user_question}' based on the following information:\n\n{top_chunks}")
+    
+    # Generate the response
+             response = llm([user_message])
+    
+    # Extract the text content from the response
+             answer = response.content
+            else:
+    # Fallback message if no relevant content is found
+             answer = generate_dynamic_out_of_context_message(summary)
+
+            st.write("### Answer:")
+            st.write(answer)
 
 if __name__ == '__main__':
     main()
